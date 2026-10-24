@@ -212,6 +212,14 @@ class HotkeyListenerThread(QThread):
         return str(char).lower() if char is not None else str(key).lower()
 
     @classmethod
+    def _is_caps_lock(cls, key):
+        """Identify Caps Lock reliably across pynput's platform key types."""
+        if cls._key_name(key) in {"caps_lock", "capslock", "caps lock"}:
+            return True
+        # On macOS, pynput may expose this toggle as a raw virtual key code.
+        return sys.platform == "darwin" and getattr(key, "vk", None) == 57
+
+    @classmethod
     def parse_hotkey(cls, hotkey):
         parsed_keys = keyboard.HotKey.parse(hotkey)
         if not any(cls._key_name(key) not in cls.MODIFIER_NAMES for key in parsed_keys):
@@ -233,26 +241,38 @@ class HotkeyListenerThread(QThread):
             self._active_key = None
 
     def on_press(self, key, injected=False):
-        if injected or self.listener is None:
+        if injected or key is None or self.listener is None:
             return
 
-        canonical_key = self.listener.canonical(key)
-        with self._state_lock:
-            self._active_key = canonical_key
-            try:
-                # HotKey uses pynput's platform canonicalization and waits for
-                # the complete chord, so modifiers alone cannot activate it.
-                self.hotkey_state.press(canonical_key)
-            finally:
-                self._active_key = None
+        try:
+            if self._is_caps_lock(key):
+                return
+            canonical_key = self.listener.canonical(key)
+            with self._state_lock:
+                self._active_key = canonical_key
+                try:
+                    # HotKey uses pynput's platform canonicalization and waits for
+                    # the complete chord, so modifiers alone cannot activate it.
+                    self.hotkey_state.press(canonical_key)
+                finally:
+                    self._active_key = None
+        except Exception as error:
+            # A platform-specific key event must never take down the listener
+            # (or the whole app); simply ignore an event pynput cannot handle.
+            print(f"[WARN] Ignoring unsupported key press {key!r}: {error}")
 
     def on_release(self, key, injected=False):
-        if injected or self.listener is None:
+        if injected or key is None or self.listener is None:
             return
 
-        canonical_key = self.listener.canonical(key)
-        with self._state_lock:
-            self.hotkey_state.release(canonical_key)
+        try:
+            if self._is_caps_lock(key):
+                return
+            canonical_key = self.listener.canonical(key)
+            with self._state_lock:
+                self.hotkey_state.release(canonical_key)
+        except Exception as error:
+            print(f"[WARN] Ignoring unsupported key release {key!r}: {error}")
 
     def _on_hotkey_activated(self):
         # Ignore activation if the chord became complete by pressing a modifier
@@ -268,8 +288,10 @@ class HotkeyListenerThread(QThread):
             )
             self.listener.start()
             self.listener.join()
-        except (KeyError, ValueError, RuntimeError) as e:
-            print(f"[ERROR] pynput listener: {e}")
+        except Exception as error:
+            # pynput re-raises exceptions from its callback thread at join();
+            # keep an unexpected keyboard event from aborting the Qt app.
+            print(f"[ERROR] pynput listener stopped unexpectedly: {error}")
         finally:
             self._active_key = None
 
