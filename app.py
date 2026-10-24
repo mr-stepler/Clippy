@@ -280,9 +280,40 @@ class HotkeyListenerThread(QThread):
         if self._active_key in self.trigger_keys:
             self.signal.triggered.emit()
 
+    @staticmethod
+    def _keyboard_listener_class():
+        """Use a macOS keyboard-only event tap, avoiding AppKit media-key parsing.
+
+        pynput's Darwin listener subscribes to NSSystemDefined events and converts
+        them with NSEvent.eventWithCGEvent_ inside its event-tap callback. Recent
+        macOS releases can assert that Caps Lock input-source lookups run on the
+        main queue, so avoid those unrelated system-defined events entirely.
+        """
+        if sys.platform != "darwin":
+            return keyboard.Listener
+
+        from Quartz import (
+            CGEventMaskBit,
+            kCGEventFlagsChanged,
+            kCGEventKeyDown,
+            kCGEventKeyUp,
+        )
+
+        event_mask = (
+            CGEventMaskBit(kCGEventKeyDown)
+            | CGEventMaskBit(kCGEventKeyUp)
+            | CGEventMaskBit(kCGEventFlagsChanged)
+        )
+        return type(
+            "ClippyKeyboardListener",
+            (keyboard.Listener,),
+            {"_EVENTS": event_mask},
+        )
+
     def run(self):
         try:
-            self.listener = keyboard.Listener(
+            listener_class = self._keyboard_listener_class()
+            self.listener = listener_class(
                 on_press=self.on_press,
                 on_release=self.on_release,
             )
