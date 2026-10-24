@@ -65,6 +65,24 @@ PINNED_STORE_PATH = os.path.join(APP_SUPPORT_DIR, "pinned.json")
 SETTINGS = QSettings("ClippyApp", "Clippy")
 DEFAULT_HOTKEY = "<cmd>+<shift>+v"
 
+# Common macOS/system and application shortcuts that can interfere with Clippy.
+# Conflicts vary by app and user configuration, so this list is advisory, not exhaustive.
+STANDARD_SHORTCUT_WARNINGS = {
+    frozenset({"cmd", "w"}): "Cmd + W usually closes the active window.",
+    frozenset({"cmd", "shift", "w"}): "Cmd + Shift + W often closes all windows in the active app.",
+    frozenset({"cmd", "q"}): "Cmd + Q usually quits the active app.",
+    frozenset({"cmd", "shift", "q"}): "Cmd + Shift + Q can log out of macOS.",
+    frozenset({"cmd", "h"}): "Cmd + H hides the active app.",
+    frozenset({"cmd", "m"}): "Cmd + M minimizes the active window.",
+    frozenset({"cmd", " "}): "Cmd + Space is commonly assigned to Spotlight.",
+    frozenset({"cmd", "shift", "3"}): "Cmd + Shift + 3 takes a screenshot on macOS.",
+    frozenset({"cmd", "shift", "4"}): "Cmd + Shift + 4 starts a screenshot selection.",
+    frozenset({"cmd", "shift", "5"}): "Cmd + Shift + 5 opens screenshot controls.",
+    frozenset({"cmd", "ctrl", "q"}): "Control + Cmd + Q locks the macOS screen.",
+    frozenset({"cmd", "shift", "s"}): "Cmd + Shift + S is commonly used for Save As.",
+    frozenset({"cmd", "shift", "g"}): "Cmd + Shift + G opens Go to Folder in Finder.",
+}
+
 # Pasteboard types apps use (by convention: https://nspasteboard.org) to mark
 # a copy as private - password managers being the main example. Respecting
 # them means Clippy simply never records that particular copy.
@@ -510,6 +528,12 @@ class SettingsDialog(QDialog):
         self.hotkey_field = HotkeyCaptureField(current_hotkey, self)
         form.addRow("Global hotkey:", self.hotkey_field)
 
+        self.hotkey_warning = QLabel(self)
+        self.hotkey_warning.setWordWrap(True)
+        form.addRow(self.hotkey_warning)
+        self.hotkey_field.textChanged.connect(self._update_hotkey_warning)
+        self._update_hotkey_warning()
+
         self.fetch_previews_checkbox = QCheckBox("Fetch link title && favicon (uses network)", self)
         self.fetch_previews_checkbox.setChecked(fetch_previews)
         form.addRow(self.fetch_previews_checkbox)
@@ -522,6 +546,20 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _update_hotkey_warning(self, _text=None):
+        parsed_keys = HotkeyListenerThread.parse_hotkey(self.hotkey_field.hotkey)
+        signature = frozenset(HotkeyListenerThread._key_name(key) for key in parsed_keys)
+        warning = STANDARD_SHORTCUT_WARNINGS.get(signature)
+
+        if warning:
+            self.hotkey_warning.setStyleSheet("color: #ffb454; font-size: 11px;")
+            self.hotkey_warning.setText(f"⚠ Not recommended: {warning}")
+        else:
+            self.hotkey_warning.setStyleSheet("color: #999999; font-size: 11px;")
+            self.hotkey_warning.setText(
+                "No known conflict in the built-in list; other apps may use this shortcut."
+            )
 
     def result_values(self):
         return self.hotkey_field.hotkey, self.fetch_previews_checkbox.isChecked()
