@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import threading
+from html.parser import HTMLParser
 
 # Import PySide6 first and neutralize its "__feature__" auto-detection hook
 # *before* anything else is imported. That hook wraps every subsequent
@@ -104,6 +105,44 @@ CODE_HINTS = (
     "def ", "class ", "function", "=>", "import ", "#include", "console.log(",
     "public static", "SELECT ", "</", "{", "};", "print(", "return ",
 )
+
+
+class FaviconLinkParser(HTMLParser):
+    """Choose the largest declared site icon from an HTML document."""
+
+    ICON_RELS = {"icon", "apple-touch-icon", "apple-touch-icon-precomposed"}
+
+    def __init__(self):
+        super().__init__()
+        self.candidates = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "link":
+            return
+
+        attributes = {name.lower(): value or "" for name, value in attrs if name}
+        rels = set(attributes.get("rel", "").lower().split())
+        href = attributes.get("href", "").strip()
+        if not href or not rels.intersection(self.ICON_RELS):
+            return
+
+        size_score = 0
+        for size in attributes.get("sizes", "").lower().split():
+            if size == "any":
+                size_score = max(size_score, 1_000_000)
+                continue
+            match = re.fullmatch(r"(\d+)[x×](\d+)", size)
+            if match:
+                width, height = (min(int(value), 1024) for value in match.groups())
+                size_score = max(size_score, width * height)
+
+        rel_score = 1 if "icon" in rels else 0
+        self.candidates.append((size_score, rel_score, href))
+
+    def best_href(self):
+        if not self.candidates:
+            return None
+        return max(self.candidates, key=lambda entry: entry[:2])[2]
 
 
 def classify_text(text: str) -> str:
@@ -1015,9 +1054,33 @@ class ClipboardApp(QWidget):
         if not url.host():
             return
 
-        favicon_url = QUrl(f"https://www.google.com/s2/favicons?sz=64&domain={url.host()}")
-        self._start_preview_request(favicon_url, item, "favicon")
-        self._start_preview_request(url, item, "title")
+        self._start_preview_request(url, item, "page")
+
+    @staticmethod
+    def _favicon_url_from_page(page_url, page_data):
+        parser = FaviconLinkParser()
+        parser.feed(page_data.decode("utf-8", "ignore"))
+        href = parser.best_href()
+        icon_url = page_url.resolved(QUrl(href)) if href else page_url.resolved(QUrl("/favicon.ico"))
+        if icon_url.scheme().lower() not in ("http", "https"):
+            return None
+        return icon_url
+
+    def _request_google_favicon(self, item):
+        """Use Google's favicon index only if the site's own icon cannot be read."""
+        if item.get("_google_favicon_requested"):
+            return
+
+        raw = item["data"].strip()
+        page_url = QUrl(raw if "://" in raw else "http://" + raw)
+        if not page_url.host():
+            return
+
+        item["_google_favicon_requested"] = True
+        favicon_url = QUrl(
+            f"https://www.google.com/s2/favicons?sz=128&domain={page_url.host()}"
+        )
+        self._start_preview_request(favicon_url, item, "favicon_google")
 
     def _start_preview_request(self, url, item, kind):
         reply = self.network_manager.get(QNetworkRequest(url))
@@ -1025,16 +1088,39 @@ class ClipboardApp(QWidget):
 
     def _on_preview_reply(self, reply, item, kind):
         try:
-            if reply.error() == reply.NetworkError.NoError:
-                data = bytes(reply.readAll())
-                if kind == "favicon" and data:
+            if reply.error() != reply.NetworkError.NoError:
+                if kind == "favicon_direct":
+                    self._request_google_favicon(item)
+                elif kind == "page":
+                    self._request_google_favicon(item)
+                return
+
+            data = bytes(reply.readAll())
+            if kind in ("favicon_direct", "favicon_google"):
+                image = QImage()
+                if data and image.loadFromData(data):
                     item["link_favicon_b64"] = base64.b64encode(data).decode("ascii")
-                elif kind == "title":
-                    match = TITLE_TAG_RE.search(data)
-                    if match:
-                        title = re.sub(r"\s+", " ", match.group(1).decode("utf-8", "ignore")).strip()
-                        if title:
-                            item["link_title"] = html.unescape(title)[:200]
+                    item.pop("_favicon_pixmap", None)
+                    if item.get("pinned"):
+                        self._save_pinned()
+                    self._refresh_row(item)
+                elif kind == "favicon_direct":
+                    self._request_google_favicon(item)
+                return
+
+            if kind == "page":
+                match = TITLE_TAG_RE.search(data)
+                if match:
+                    title = re.sub(r"\s+", " ", match.group(1).decode("utf-8", "ignore")).strip()
+                    if title:
+                        item["link_title"] = html.unescape(title)[:200]
+
+                favicon_url = self._favicon_url_from_page(reply.url(), data)
+                if favicon_url is not None:
+                    self._start_preview_request(favicon_url, item, "favicon_direct")
+                else:
+                    self._request_google_favicon(item)
+
                 if item.get("pinned"):
                     self._save_pinned()
                 self._refresh_row(item)
