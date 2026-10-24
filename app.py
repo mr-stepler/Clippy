@@ -679,9 +679,9 @@ class SettingsDialog(QDialog):
         ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
         if ok_button is not None:
-            ok_button.setToolTip("Save settings")
+            ok_button.setToolTip("Save")
         if cancel_button is not None:
-            cancel_button.setToolTip("Discard changes")
+            cancel_button.setToolTip("Cancel")
         layout.addWidget(buttons)
 
     def _update_hotkey_warning(self, _text=None):
@@ -866,7 +866,7 @@ class ClipboardApp(QWidget):
         top_layout = QHBoxLayout()
         self.search_bar = QLineEdit(self)
         self.search_bar.setPlaceholderText("Search text, links...")
-        self.search_bar.setToolTip("Search text, link URLs, page titles, and domains")
+        self.search_bar.setToolTip("Search text, titles, domains")
         self.search_bar.textChanged.connect(lambda _text: self._render_list())
         top_layout.addWidget(self.search_bar)
 
@@ -879,7 +879,7 @@ class ClipboardApp(QWidget):
 
         self.clear_btn = QPushButton("Clear", self)
         self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.clear_btn.setToolTip("Clear unpinned history (keeps pinned items)")
+        self.clear_btn.setToolTip("Clear unpinned")
         self.clear_btn.clicked.connect(self.clear_history)
         top_layout.addWidget(self.clear_btn)
 
@@ -887,7 +887,7 @@ class ClipboardApp(QWidget):
         self.close_btn = QPushButton("\u2715", self)
         self.close_btn.setObjectName("CloseBtn")
         self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.close_btn.setToolTip("Quit Clippy")
+        self.close_btn.setToolTip("Quit")
         self.close_btn.clicked.connect(QApplication.quit)
         top_layout.addWidget(self.close_btn)
 
@@ -896,13 +896,13 @@ class ClipboardApp(QWidget):
         # Quick type filter row
         filter_layout = QHBoxLayout()
         self.filter_all_btn = QPushButton("All", self)
-        self.filter_all_btn.setToolTip("Show all clipboard items")
+        self.filter_all_btn.setToolTip("All items")
         self.filter_text_btn = QPushButton("Text", self)
-        self.filter_text_btn.setToolTip("Show text and code items")
+        self.filter_text_btn.setToolTip("Text items")
         self.filter_image_btn = QPushButton("Images", self)
-        self.filter_image_btn.setToolTip("Show image items")
+        self.filter_image_btn.setToolTip("Images")
         self.filter_link_btn = QPushButton("Links", self)
-        self.filter_link_btn.setToolTip("Show copied links")
+        self.filter_link_btn.setToolTip("Links")
 
         self.filter_group = QButtonGroup(self)
         self.filter_group.setExclusive(True)
@@ -942,9 +942,9 @@ class ClipboardApp(QWidget):
         )
         self.toast_label.setStyleSheet("""
             QLabel {
-                background-color: #000000;
-                color: #ffffff;
-                border: 1px solid #333333;
+                background-color: #2d2d2d;
+                color: #cccccc;
+                border: 1px solid #3c3c3c;
                 border-radius: 5px;
                 padding: 4px 8px;
                 font-size: 11px;
@@ -1501,9 +1501,9 @@ if __name__ == "__main__":
             color: #ffffff;
             background-color: #000000;
             border: 1px solid #333333;
-            border-radius: 5px;
-            padding: 4px 8px;
-            font-size: 11px;
+            border-radius: 4px;
+            padding: 2px 5px;
+            font-size: 10px;
         }
     """)
 
