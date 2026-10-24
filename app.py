@@ -351,7 +351,8 @@ class HistoryRowWidget(QWidget):
 
         self.icon_label = QLabel(self)
         self.icon_label.setFixedSize(28, 28)
-        self.icon_label.setScaledContents(True)
+        # Each preview is sized once before display; avoid a second scaling pass.
+        self.icon_label.setScaledContents(False)
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.text_label = QLabel(self)
@@ -419,18 +420,21 @@ class HistoryRowWidget(QWidget):
         elif kind == "url":
             self.icon_label.show()
             favicon_b64 = item.get("link_favicon_b64")
-            if favicon_b64:
-                pixmap = item.get("_favicon_pixmap")
-                if pixmap is None:
-                    pixmap = QPixmap()
-                    pixmap.loadFromData(base64.b64decode(favicon_b64))
+            pixmap = item.get("_favicon_pixmap")
+            if favicon_b64 and pixmap is None:
+                pixmap = QPixmap()
+                pixmap.loadFromData(base64.b64decode(favicon_b64))
+                # Keep small favicons at their native resolution; enlarging them
+                # and then scaling QLabel again made the preview look blurry.
+                if not pixmap.isNull() and (pixmap.width() > 24 or pixmap.height() > 24):
                     pixmap = pixmap.scaled(
-                        20, 20,
+                        24, 24,
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
-                    item["_favicon_pixmap"] = pixmap
+                item["_favicon_pixmap"] = pixmap
 
+            if pixmap is not None and not pixmap.isNull():
                 self.icon_label.setText("")
                 self.icon_label.setPixmap(pixmap)
                 self.icon_label.setStyleSheet("background: transparent;")
