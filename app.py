@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import threading
 
 # Import PySide6 first and neutralize its "__feature__" auto-detection hook
 # *before* anything else is imported. That hook wraps every subsequent
@@ -153,11 +154,12 @@ class HotkeyListenerThread(QThread):
     def __init__(self, hk_signal, hotkey):
         super().__init__()
         self.signal = hk_signal
-        self.hotkey = hotkey
         self.listener = None
         self.hotkey_state = None
         self.trigger_keys = set()
         self._active_key = None
+        self._state_lock = threading.RLock()
+        self.set_hotkey(hotkey)
 
     @staticmethod
     def _key_name(key):
@@ -176,22 +178,41 @@ class HotkeyListenerThread(QThread):
             raise ValueError("The hotkey must include a non-modifier key")
         return parsed_keys
 
+    def set_hotkey(self, hotkey):
+        """Update the chord without stopping/restarting the OS keyboard listener."""
+        parsed_keys = self.parse_hotkey(hotkey)
+        trigger_keys = {
+            key for key in parsed_keys
+            if self._key_name(key) not in self.MODIFIER_NAMES
+        }
+        hotkey_state = keyboard.HotKey(parsed_keys, self._on_hotkey_activated)
+
+        with self._state_lock:
+            self.hotkey_state = hotkey_state
+            self.trigger_keys = trigger_keys
+            self._active_key = None
+
     def on_press(self, key, injected=False):
-        if injected or self.listener is None or self.hotkey_state is None:
+        if injected or self.listener is None:
             return
 
         canonical_key = self.listener.canonical(key)
-        self._active_key = canonical_key
-        try:
-            # HotKey tracks the full chord and canonicalizes platform-specific
-            # key events, so modifier-only presses cannot activate the shortcut.
-            self.hotkey_state.press(canonical_key)
-        finally:
-            self._active_key = None
+        with self._state_lock:
+            self._active_key = canonical_key
+            try:
+                # HotKey uses pynput's platform canonicalization and waits for
+                # the complete chord, so modifiers alone cannot activate it.
+                self.hotkey_state.press(canonical_key)
+            finally:
+                self._active_key = None
 
     def on_release(self, key, injected=False):
-        if not injected and self.listener is not None and self.hotkey_state is not None:
-            self.hotkey_state.release(self.listener.canonical(key))
+        if injected or self.listener is None:
+            return
+
+        canonical_key = self.listener.canonical(key)
+        with self._state_lock:
+            self.hotkey_state.release(canonical_key)
 
     def _on_hotkey_activated(self):
         # Ignore activation if the chord became complete by pressing a modifier
@@ -201,12 +222,6 @@ class HotkeyListenerThread(QThread):
 
     def run(self):
         try:
-            parsed_keys = self.parse_hotkey(self.hotkey)
-            self.trigger_keys = {
-                key for key in parsed_keys
-                if self._key_name(key) not in self.MODIFIER_NAMES
-            }
-            self.hotkey_state = keyboard.HotKey(parsed_keys, self._on_hotkey_activated)
             self.listener = keyboard.Listener(
                 on_press=self.on_press,
                 on_release=self.on_release,
@@ -849,13 +864,10 @@ class ClipboardApp(QWidget):
             SETTINGS.setValue("fetch_link_previews", fetch_previews)
 
     def apply_hotkey(self, hotkey):
-        """Swap the running listener thread for one bound to the new combo."""
+        """Update the live listener in place and persist the new combo."""
+        self.listener_thread.set_hotkey(hotkey)
         self.hotkey = hotkey
         SETTINGS.setValue("hotkey", hotkey)
-        if self.listener_thread:
-            self.listener_thread.stop()
-        self.listener_thread = HotkeyListenerThread(self.hotkey_signal, hotkey)
-        self.listener_thread.start()
 
     # --- Persistence of pinned items ---------------------------------------
 
@@ -1266,6 +1278,14 @@ class ClipboardApp(QWidget):
 
 
 if __name__ == "__main__":
+    if sys.platform == "darwin":
+        # Keep physical Command and Control keys distinct in Qt key events.
+        mac_modifier_attr = getattr(
+            Qt.ApplicationAttribute, "AA_MacDontSwapCtrlAndMeta", None
+        )
+        if mac_modifier_attr is not None:
+            QApplication.setAttribute(mac_modifier_attr, True)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
