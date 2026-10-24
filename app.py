@@ -459,19 +459,38 @@ class HistoryRowWidget(QWidget):
         elif kind == "url":
             self.icon_label.show()
             favicon_b64 = item.get("link_favicon_b64")
+            dpr = max(1.0, self.icon_label.devicePixelRatioF())
             pixmap = item.get("_favicon_pixmap")
-            if favicon_b64 and pixmap is None:
-                pixmap = QPixmap()
-                pixmap.loadFromData(base64.b64decode(favicon_b64))
-                # Keep small favicons at their native resolution; enlarging them
-                # and then scaling QLabel again made the preview look blurry.
-                if not pixmap.isNull() and (pixmap.width() > 24 or pixmap.height() > 24):
-                    pixmap = pixmap.scaled(
-                        24, 24,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
+            if favicon_b64 and (
+                pixmap is None or item.get("_favicon_pixmap_dpr") != dpr
+            ):
+                image = item.get("_favicon_source_image")
+                if image is None:
+                    image = QImage()
+                    image.loadFromData(base64.b64decode(favicon_b64))
+                    if not image.isNull():
+                        item["_favicon_source_image"] = image
+
+                pixmap = None
+                if not image.isNull():
+                    # Render at device resolution for Retina screens. Use nearest-
+                    # neighbor only when enlarging a low-resolution source, to
+                    # keep edges crisp instead of introducing blur.
+                    target_size = round(24 * dpr)
+                    transform = (
+                        Qt.TransformationMode.SmoothTransformation
+                        if max(image.width(), image.height()) >= target_size
+                        else Qt.TransformationMode.FastTransformation
                     )
-                item["_favicon_pixmap"] = pixmap
+                    pixmap = QPixmap.fromImage(image).scaled(
+                        target_size,
+                        target_size,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        transform,
+                    )
+                    pixmap.setDevicePixelRatio(dpr)
+                    item["_favicon_pixmap"] = pixmap
+                    item["_favicon_pixmap_dpr"] = dpr
 
             if pixmap is not None and not pixmap.isNull():
                 self.icon_label.setText("")
@@ -1101,6 +1120,8 @@ class ClipboardApp(QWidget):
                 if data and image.loadFromData(data):
                     item["link_favicon_b64"] = base64.b64encode(data).decode("ascii")
                     item.pop("_favicon_pixmap", None)
+                    item.pop("_favicon_pixmap_dpr", None)
+                    item.pop("_favicon_source_image", None)
                     if item.get("pinned"):
                         self._save_pinned()
                     self._refresh_row(item)
