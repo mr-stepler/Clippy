@@ -125,17 +125,11 @@ class HotkeySignal(QObject):
 
 
 class HotkeyListenerThread(QThread):
-    """Listen for the configured shortcut, activating only on its final key."""
+    """Listen for the configured shortcut, activating on its final key."""
 
     MODIFIER_NAMES = {
         "cmd", "cmd_l", "cmd_r", "ctrl", "ctrl_l", "ctrl_r",
         "alt", "alt_l", "alt_r", "alt_gr", "shift", "shift_l", "shift_r",
-    }
-    MODIFIER_ALIASES = {
-        "cmd_l": "cmd", "cmd_r": "cmd",
-        "ctrl_l": "ctrl", "ctrl_r": "ctrl",
-        "alt_l": "alt", "alt_r": "alt",
-        "shift_l": "shift", "shift_r": "shift",
     }
 
     def __init__(self, hk_signal, hotkey):
@@ -143,13 +137,13 @@ class HotkeyListenerThread(QThread):
         self.signal = hk_signal
         self.hotkey = hotkey
         self.listener = None
-        self.required_keys = set()
+        self.hotkey_state = None
         self.trigger_keys = set()
-        self.pressed_keys = set()
+        self._active_key = None
 
     @staticmethod
     def _key_name(key):
-        """Return a stable lowercase name for a pynput key event."""
+        """Return a lowercase name for a parsed pynput key."""
         name = getattr(key, "name", None)
         if name is not None:
             return str(name).lower()
@@ -158,43 +152,43 @@ class HotkeyListenerThread(QThread):
         return str(char).lower() if char is not None else str(key).lower()
 
     @classmethod
-    def _canonical_name(cls, name):
-        return cls.MODIFIER_ALIASES.get(name, name)
+    def parse_hotkey(cls, hotkey):
+        parsed_keys = keyboard.HotKey.parse(hotkey)
+        if not any(cls._key_name(key) not in cls.MODIFIER_NAMES for key in parsed_keys):
+            raise ValueError("The hotkey must include a non-modifier key")
+        return parsed_keys
 
     def on_press(self, key, injected=False):
-        if injected:
+        if injected or self.listener is None or self.hotkey_state is None:
             return
 
-        key_name = self._key_name(key)
-        canonical_name = self._canonical_name(key_name)
-        is_first_press = key_name not in self.pressed_keys
-        self.pressed_keys.add(key_name)
-        pressed_names = {self._canonical_name(name) for name in self.pressed_keys}
-
-        # A modifier-only chord (Cmd+Shift) must never toggle the window. The
-        # configured character key has to be pressed while every chord key is down.
-        if (
-            is_first_press
-            and canonical_name in self.trigger_keys
-            and self.required_keys.issubset(pressed_names)
-        ):
-            self.signal.triggered.emit()
+        canonical_key = self.listener.canonical(key)
+        self._active_key = canonical_key
+        try:
+            # HotKey tracks the full chord and canonicalizes platform-specific
+            # key events, so modifier-only presses cannot activate the shortcut.
+            self.hotkey_state.press(canonical_key)
+        finally:
+            self._active_key = None
 
     def on_release(self, key, injected=False):
-        if not injected:
-            self.pressed_keys.discard(self._key_name(key))
+        if not injected and self.listener is not None and self.hotkey_state is not None:
+            self.hotkey_state.release(self.listener.canonical(key))
+
+    def _on_hotkey_activated(self):
+        # Ignore activation if the chord became complete by pressing a modifier
+        # after the main key; require the configured non-modifier key last.
+        if self._active_key in self.trigger_keys:
+            self.signal.triggered.emit()
 
     def run(self):
         try:
-            parsed_keys = keyboard.HotKey.parse(self.hotkey)
-            self.required_keys = {
-                self._canonical_name(self._key_name(key)) for key in parsed_keys
+            parsed_keys = self.parse_hotkey(self.hotkey)
+            self.trigger_keys = {
+                key for key in parsed_keys
+                if self._key_name(key) not in self.MODIFIER_NAMES
             }
-            self.trigger_keys = self.required_keys - self.MODIFIER_NAMES
-            if not self.trigger_keys:
-                raise ValueError("The hotkey must include a non-modifier key")
-
-            self.pressed_keys.clear()
+            self.hotkey_state = keyboard.HotKey(parsed_keys, self._on_hotkey_activated)
             self.listener = keyboard.Listener(
                 on_press=self.on_press,
                 on_release=self.on_release,
@@ -204,7 +198,7 @@ class HotkeyListenerThread(QThread):
         except (KeyError, ValueError, RuntimeError) as e:
             print(f"[ERROR] pynput listener: {e}")
         finally:
-            self.pressed_keys.clear()
+            self._active_key = None
 
     def stop(self):
         if self.listener:
@@ -477,7 +471,13 @@ class HotkeyCaptureField(QLineEdit):
             return  # require at least one modifier plus a real character
 
         parts.append(text.lower())
-        self.hotkey = "+".join(parts)
+        candidate = "+".join(parts)
+        try:
+            HotkeyListenerThread.parse_hotkey(candidate)
+        except (KeyError, ValueError):
+            return
+
+        self.hotkey = candidate
         self.setText(self._display(self.hotkey))
 
 
@@ -544,6 +544,13 @@ class ClipboardApp(QWidget):
         self.active_filter = "all"  # "all" | "text" | "image"
 
         self.hotkey = SETTINGS.value("hotkey", DEFAULT_HOTKEY, type=str)
+        try:
+            HotkeyListenerThread.parse_hotkey(self.hotkey)
+        except (KeyError, ValueError) as error:
+            print(f"[WARN] Invalid saved hotkey {self.hotkey!r}; restoring the default: {error}")
+            self.hotkey = DEFAULT_HOTKEY
+            SETTINGS.setValue("hotkey", self.hotkey)
+
         self.fetch_previews_enabled = SETTINGS.value("fetch_link_previews", False, type=bool)
 
         # UI widget declarations
