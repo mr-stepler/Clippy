@@ -866,7 +866,7 @@ class ClipboardApp(QWidget):
         top_layout = QHBoxLayout()
         self.search_bar = QLineEdit(self)
         self.search_bar.setPlaceholderText("Search text, links...")
-        self.search_bar.setToolTip("Search text, titles, domains")
+        self.search_bar.setToolTip("Search title/domain")
         self.search_bar.textChanged.connect(lambda _text: self._render_list())
         top_layout.addWidget(self.search_bar)
 
@@ -1502,8 +1502,8 @@ if __name__ == "__main__":
             background-color: #2d2d2d;
             border: 1px solid #3c3c3c;
             border-radius: 5px;
-            padding: 1px 4px;
-            font-size: 9px;
+            padding: 0px 2px;
+            font-size: 11px;
         }
     """)
 
