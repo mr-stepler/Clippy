@@ -1498,12 +1498,12 @@ if __name__ == "__main__":
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet("""
         QToolTip {
-            color: #ffffff;
-            background-color: #000000;
-            border: 1px solid #333333;
-            border-radius: 4px;
-            padding: 2px 5px;
-            font-size: 10px;
+            color: #cccccc;
+            background-color: #2d2d2d;
+            border: 1px solid #3c3c3c;
+            border-radius: 5px;
+            padding: 1px 4px;
+            font-size: 9px;
         }
     """)
 
