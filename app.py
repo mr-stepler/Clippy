@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 # Import PySide6 first and neutralize its "__feature__" auto-detection hook
 # *before* anything else is imported. That hook wraps every subsequent
@@ -656,7 +657,7 @@ class ClipboardApp(QWidget):
         self.last_clip_text = ""
         self.last_image_key = None
         self.drag_position = QPoint()
-        self.active_filter = "all"  # "all" | "text" | "image"
+        self.active_filter = "all"  # "all" | "text" | "image" | "link"
 
         self.hotkey = SETTINGS.value("hotkey", DEFAULT_HOTKEY, type=str)
         try:
@@ -676,6 +677,7 @@ class ClipboardApp(QWidget):
         self.filter_all_btn = None
         self.filter_text_btn = None
         self.filter_image_btn = None
+        self.filter_link_btn = None
         self.list_widget = None
         self.toast_label = None
 
@@ -804,7 +806,8 @@ class ClipboardApp(QWidget):
         # Top control bar
         top_layout = QHBoxLayout()
         self.search_bar = QLineEdit(self)
-        self.search_bar.setPlaceholderText("Search...")
+        self.search_bar.setPlaceholderText("Search text, links...")
+        self.search_bar.setToolTip("Search text, link URLs, page titles, and domains")
         self.search_bar.textChanged.connect(lambda _text: self._render_list())
         top_layout.addWidget(self.search_bar)
 
@@ -835,6 +838,7 @@ class ClipboardApp(QWidget):
         self.filter_all_btn = QPushButton("All", self)
         self.filter_text_btn = QPushButton("Text", self)
         self.filter_image_btn = QPushButton("Images", self)
+        self.filter_link_btn = QPushButton("Links", self)
 
         self.filter_group = QButtonGroup(self)
         self.filter_group.setExclusive(True)
@@ -842,6 +846,7 @@ class ClipboardApp(QWidget):
             (self.filter_all_btn, "all"),
             (self.filter_text_btn, "text"),
             (self.filter_image_btn, "image"),
+            (self.filter_link_btn, "link"),
         ):
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1144,7 +1149,8 @@ class ClipboardApp(QWidget):
 
                 if item.get("pinned"):
                     self._save_pinned()
-                self._refresh_row(item)
+                # A newly fetched title can make a link match the active search.
+                self._render_list()
         finally:
             reply.deleteLater()
 
@@ -1271,25 +1277,52 @@ class ClipboardApp(QWidget):
 
         self._row_widgets[id(item)] = row
 
+    @staticmethod
+    def _searchable_text_for_item(item):
+        """Combine clipboard text with searchable link title and domain metadata."""
+        data = str(item.get("data", ""))
+        searchable_parts = [data]
+
+        if item.get("type") == "text" and item.get("kind") == "url":
+            title = str(item.get("link_title", ""))
+            raw_url = data.strip()
+            try:
+                parsed_url = urlsplit(
+                    raw_url if "://" in raw_url else f"http://{raw_url}"
+                )
+                domain = (parsed_url.hostname or "").casefold()
+            except ValueError:
+                domain = ""
+
+            searchable_parts.extend((title, domain))
+            if domain.startswith("www."):
+                searchable_parts.append(domain[4:])
+
+        return " ".join(part for part in searchable_parts if part).casefold()
+
     def _render_list(self):
-        """Rebuild the visible list from history, applying the type filter and
-        a simple "all words, any order" substring search."""
-        query_words = self.search_bar.text().lower().split() if self.search_bar else []
+        """Rebuild the list with type filters and an all-words substring search."""
+        query_words = self.search_bar.text().casefold().split() if self.search_bar else []
 
         self.list_widget.clear()
         self._row_widgets.clear()
 
         for item in self._sorted_history():
-            if self.active_filter == "text" and item["type"] != "text":
+            is_link = item["type"] == "text" and item.get("kind") == "url"
+            if self.active_filter == "text" and (
+                item["type"] != "text" or is_link
+            ):
                 continue
             if self.active_filter == "image" and item["type"] != "image":
+                continue
+            if self.active_filter == "link" and not is_link:
                 continue
 
             if query_words:
                 if item["type"] != "text":
                     continue
-                haystack = item["data"].lower()
-                if not all(word in haystack for word in query_words):
+                searchable_text = self._searchable_text_for_item(item)
+                if not all(word in searchable_text for word in query_words):
                     continue
 
             self._add_item_to_widget(item)

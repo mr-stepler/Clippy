@@ -8,7 +8,8 @@ A lightweight, minimal, and fast clipboard manager for macOS built with Python a
 
 * **Global Hotkey:** Press `Cmd + Shift + V` anytime to toggle the clipboard window. Settings warn about common macOS shortcut conflicts.
 * **Smart Text & Image Capture:** Automatically saves copied text snippets, screenshot images, and image files from Finder/Desktop.
-* **Instant Search:** Filter your text clipboard history in real-time.
+* **Instant Search & Type Filters:** Search text and links in real time; link search includes the URL and domain, plus the page title when link previews are enabled. Filter by All, Text, Images, or Links.
+* **Opt-in Link Previews:** Fetch a copied page's title and favicon to recognize links; network requests are off by default.
 * **Click-to-copy, no auto-paste:** Clicking a history item restores it to the system clipboard. Switch to the target app and paste manually with `Cmd + V`.
 * **Cursor Feedback:** Subtle dark popup notification next to your mouse when copying items back.
 * **Minimalist UI:** Borderless dark-mode design that stays out of your way.
