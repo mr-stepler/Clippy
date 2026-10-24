@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -45,3 +45,14 @@ jobs:
           path: dist/Clippy.dmg
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish GitHub release
+        if: github.event_name == 'push' && startsWith(github.event.head_commit.message, 'release:')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create 1.2.0 dist/Clippy.dmg \
+            --repo mr-stepler/Clippy \
+            --target "$GITHUB_SHA" \
+            --title "Clippy v1.2.0" \
+            --notes-file release-notes/1.2.0.md
