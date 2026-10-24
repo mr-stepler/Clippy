@@ -190,15 +190,29 @@ class HotkeyListenerThread(QThread):
         "cmd", "cmd_l", "cmd_r", "ctrl", "ctrl_l", "ctrl_r",
         "alt", "alt_l", "alt_r", "alt_gr", "shift", "shift_l", "shift_r",
     }
+    MODIFIER_ALIASES = {
+        "cmd_l": "cmd", "cmd_r": "cmd",
+        "ctrl_l": "ctrl", "ctrl_r": "ctrl",
+        "alt_l": "alt", "alt_r": "alt", "alt_gr": "alt",
+        "shift_l": "shift", "shift_r": "shift",
+    }
+    LISTENER_RETRY_SECONDS = 2
 
     def __init__(self, hk_signal, hotkey):
         super().__init__()
         self.signal = hk_signal
         self.listener = None
         self.hotkey_state = None
+        self.hotkey = None
+        self._parsed_keys = ()
         self.trigger_keys = set()
+        self.required_modifiers = set()
         self._active_key = None
         self._state_lock = threading.RLock()
+        self._stop_requested = threading.Event()
+        self._suppressed_darwin_keycodes = set()
+        self._quartz = None
+        self._reported_untrusted = False
         self.set_hotkey(hotkey)
 
     @staticmethod
@@ -210,6 +224,11 @@ class HotkeyListenerThread(QThread):
 
         char = getattr(key, "char", None)
         return str(char).lower() if char is not None else str(key).lower()
+
+    @classmethod
+    def _normalized_modifier_name(cls, key):
+        name = cls._key_name(key)
+        return cls.MODIFIER_ALIASES.get(name, name)
 
     @classmethod
     def _is_caps_lock(cls, key):
@@ -224,51 +243,66 @@ class HotkeyListenerThread(QThread):
         parsed_keys = keyboard.HotKey.parse(hotkey)
         if not any(cls._key_name(key) not in cls.MODIFIER_NAMES for key in parsed_keys):
             raise ValueError("The hotkey must include a non-modifier key")
+        if not any(cls._key_name(key) in cls.MODIFIER_NAMES for key in parsed_keys):
+            raise ValueError("The hotkey must include at least one modifier")
         return parsed_keys
 
     def set_hotkey(self, hotkey):
         """Update the chord without stopping/restarting the OS keyboard listener."""
         parsed_keys = self.parse_hotkey(hotkey)
         trigger_keys = {
-            key for key in parsed_keys
+            self._key_name(key) for key in parsed_keys
             if self._key_name(key) not in self.MODIFIER_NAMES
+        }
+        required_modifiers = {
+            self._normalized_modifier_name(key) for key in parsed_keys
+            if self._key_name(key) in self.MODIFIER_NAMES
         }
         hotkey_state = keyboard.HotKey(parsed_keys, self._on_hotkey_activated)
 
         with self._state_lock:
+            self.hotkey = hotkey
+            self._parsed_keys = tuple(parsed_keys)
             self.hotkey_state = hotkey_state
             self.trigger_keys = trigger_keys
+            self.required_modifiers = required_modifiers
             self._active_key = None
+            self._suppressed_darwin_keycodes.clear()
 
     def on_press(self, key, injected=False):
-        if injected or key is None or self.listener is None:
+        if injected or key is None:
             return
 
         try:
             if self._is_caps_lock(key):
                 return
-            canonical_key = self.listener.canonical(key)
+            listener = self.listener
+            if listener is None:
+                return
+            canonical_key = listener.canonical(key)
             with self._state_lock:
-                self._active_key = canonical_key
+                self._active_key = self._key_name(canonical_key)
                 try:
-                    # HotKey uses pynput's platform canonicalization and waits for
-                    # the complete chord, so modifiers alone cannot activate it.
+                    # HotKey waits for the complete chord; modifiers alone never
+                    # activate Clippy. The main key must still be pressed last.
                     self.hotkey_state.press(canonical_key)
                 finally:
                     self._active_key = None
         except Exception as error:
-            # A platform-specific key event must never take down the listener
-            # (or the whole app); simply ignore an event pynput cannot handle.
+            # A platform-specific keyboard event must never take down the listener.
             print(f"[WARN] Ignoring unsupported key press {key!r}: {error}")
 
     def on_release(self, key, injected=False):
-        if injected or key is None or self.listener is None:
+        if injected or key is None:
             return
 
         try:
             if self._is_caps_lock(key):
                 return
-            canonical_key = self.listener.canonical(key)
+            listener = self.listener
+            if listener is None:
+                return
+            canonical_key = listener.canonical(key)
             with self._state_lock:
                 self.hotkey_state.release(canonical_key)
         except Exception as error:
@@ -280,57 +314,189 @@ class HotkeyListenerThread(QThread):
         if self._active_key in self.trigger_keys:
             self.signal.triggered.emit()
 
-    @staticmethod
-    def _keyboard_listener_class():
-        """Use a macOS keyboard-only event tap, avoiding AppKit media-key parsing.
+    def _intercept_darwin_event(self, event_type, event):
+        """Consume only the configured chord so the front app cannot beep on it."""
+        quartz = self._quartz
+        if quartz is None:
+            return event
 
-        pynput's Darwin listener subscribes to NSSystemDefined events and converts
-        them with NSEvent.eventWithCGEvent_ inside its event-tap callback. Recent
-        macOS releases can assert that Caps Lock input-source lookups run on the
-        main queue, so avoid those unrelated system-defined events entirely.
+        try:
+            if event_type == quartz.kCGEventKeyUp:
+                source_pid = quartz.CGEventGetIntegerValueField(
+                    event, quartz.kCGEventSourceUnixProcessID
+                )
+                if source_pid:
+                    return event
+                keycode = int(quartz.CGEventGetIntegerValueField(
+                    event, quartz.kCGKeyboardEventKeycode))
+                with self._state_lock:
+                    if keycode in self._suppressed_darwin_keycodes:
+                        self._suppressed_darwin_keycodes.discard(keycode)
+                        return None
+                return event
+
+            if event_type != quartz.kCGEventKeyDown:
+                return event
+
+            # Match pynput's own injected-event detection so synthetic keystrokes
+            # from automation are never swallowed while this tap is active.
+            source_pid = quartz.CGEventGetIntegerValueField(
+                event, quartz.kCGEventSourceUnixProcessID
+            )
+            if source_pid:
+                return event
+
+            listener = self.listener
+            if listener is None:
+                return event
+            key = listener.canonical(listener._event_to_key(event))
+            key_name = self._key_name(key)
+            keycode = int(quartz.CGEventGetIntegerValueField(
+                event, quartz.kCGKeyboardEventKeycode))
+            flags = int(quartz.CGEventGetFlags(event))
+
+            flag_by_modifier = {
+                "cmd": quartz.kCGEventFlagMaskCommand,
+                "ctrl": quartz.kCGEventFlagMaskControl,
+                "alt": quartz.kCGEventFlagMaskAlternate,
+                "shift": quartz.kCGEventFlagMaskShift,
+            }
+            with self._state_lock:
+                if key_name not in self.trigger_keys:
+                    return event
+
+                required_flags = 0
+                for modifier in self.required_modifiers:
+                    required_flags |= flag_by_modifier.get(modifier, 0)
+                if flags & required_flags != required_flags:
+                    return event
+
+                self._suppressed_darwin_keycodes.add(keycode)
+            return None
+        except Exception as error:
+            # Fail open: never swallow a user's keystroke if Quartz cannot inspect it.
+            print(f"[WARN] Could not inspect macOS hotkey event: {error}")
+            return event
+
+    def _keyboard_listener_class(self):
+        """Use a keyboard-only macOS event tap and recover if macOS disables it.
+
+        Avoiding NSSystemDefined events also avoids AppKit conversion of media keys,
+        which has caused native Caps Lock crashes on recent macOS releases.
         """
         if sys.platform != "darwin":
             return keyboard.Listener
 
-        from Quartz import (
-            CGEventMaskBit,
-            kCGEventFlagsChanged,
-            kCGEventKeyDown,
-            kCGEventKeyUp,
-        )
-
+        quartz = importlib.import_module("Quartz")
+        self._quartz = quartz
         event_mask = (
-            CGEventMaskBit(kCGEventKeyDown)
-            | CGEventMaskBit(kCGEventKeyUp)
-            | CGEventMaskBit(kCGEventFlagsChanged)
+            quartz.CGEventMaskBit(quartz.kCGEventKeyDown)
+            | quartz.CGEventMaskBit(quartz.kCGEventKeyUp)
+            | quartz.CGEventMaskBit(quartz.kCGEventFlagsChanged)
         )
+        disabled_events = {
+            quartz.kCGEventTapDisabledByTimeout,
+            quartz.kCGEventTapDisabledByUserInput,
+        }
+
+        # pynput normally leaves its tap listen-only, which lets Cmd+Shift+V
+        # reach the foreground app and can make macOS play its "unassigned key"
+        # sound. A Darwin intercept lets us consume only Clippy's configured
+        # trigger key, while leaving every other keystroke untouched.
+        def create_event_tap(listener):
+            listener._clippy_event_tap = keyboard.Listener._create_event_tap(listener)
+            return listener._clippy_event_tap
+
+        def recover_disabled_tap(listener, proxy, event_type, event, refcon):
+            if event_type in disabled_events:
+                try:
+                    event_tap = getattr(listener, "_clippy_event_tap", None)
+                    if event_tap is not None:
+                        quartz.CGEventTapEnable(event_tap, True)
+                except Exception as error:
+                    print(f"[WARN] Could not re-enable macOS keyboard event tap: {error}")
+                return event
+            return keyboard.Listener._handler(
+                listener, proxy, event_type, event, refcon
+            )
+
         return type(
             "ClippyKeyboardListener",
             (keyboard.Listener,),
-            {"_EVENTS": event_mask},
+            {
+                "_EVENTS": event_mask,
+                "_create_event_tap": create_event_tap,
+                "_handler": recover_disabled_tap,
+                # pynput uses the immediate subclass module to recognize
+                # darwin_intercept; keep it under its Darwin backend namespace.
+                "__module__": keyboard.Listener.__module__,
+            },
         )
 
     def run(self):
-        try:
-            listener_class = self._keyboard_listener_class()
-            self.listener = listener_class(
-                on_press=self.on_press,
-                on_release=self.on_release,
-            )
-            self.listener.start()
-            self.listener.join()
-        except Exception as error:
-            # pynput re-raises exceptions from its callback thread at join();
-            # keep an unexpected keyboard event from aborting the Qt app.
-            print(f"[ERROR] pynput listener stopped unexpectedly: {error}")
-        finally:
-            self._active_key = None
+        while not self._stop_requested.is_set():
+            listener = None
+            try:
+                listener_class = self._keyboard_listener_class()
+                listener_options = {
+                    "on_press": self.on_press,
+                    "on_release": self.on_release,
+                }
+                if sys.platform == "darwin":
+                    listener_options["darwin_intercept"] = self._intercept_darwin_event
+
+                listener = listener_class(**listener_options)
+                with self._state_lock:
+                    self.listener = listener
+                    self.hotkey_state = keyboard.HotKey(
+                        self._parsed_keys, self._on_hotkey_activated
+                    )
+                    self._active_key = None
+                    self._suppressed_darwin_keycodes.clear()
+                    if not self._stop_requested.is_set():
+                        listener.start()
+
+                if self._stop_requested.is_set():
+                    break
+                listener.join()
+                if self._stop_requested.is_set():
+                    break
+
+                if getattr(listener, "IS_TRUSTED", None) is False:
+                    if not self._reported_untrusted:
+                        print(
+                            "[ERROR] macOS is blocking Clippy's keyboard listener. "
+                            "Enable Clippy in System Settings → Privacy & Security "
+                            "→ Accessibility and Input Monitoring."
+                        )
+                    self._reported_untrusted = True
+                else:
+                    self._reported_untrusted = False
+                    print("[WARN] Keyboard listener stopped unexpectedly; restarting.")
+            except Exception as error:
+                if not self._stop_requested.is_set():
+                    print(f"[ERROR] pynput listener stopped unexpectedly: {error}")
+            finally:
+                with self._state_lock:
+                    if self.listener is listener:
+                        self.listener = None
+                    self.hotkey_state = keyboard.HotKey(
+                        self._parsed_keys, self._on_hotkey_activated
+                    )
+                    self._active_key = None
+                    self._suppressed_darwin_keycodes.clear()
+
+            if self._stop_requested.wait(self.LISTENER_RETRY_SECONDS):
+                break
 
     def stop(self):
-        if self.listener:
-            self.listener.stop()
-        self.quit()
-        self.wait()
+        self._stop_requested.set()
+        with self._state_lock:
+            listener = self.listener
+        if listener is not None:
+            listener.stop()
+        if self.isRunning():
+            self.wait()
 
 
 class PinButton(QPushButton):
@@ -1455,15 +1621,27 @@ class ClipboardApp(QWidget):
 
         self.show_toast()
 
+    def _activate_native_application(self):
+        """Bring the accessory app forward before focusing its window on macOS."""
+        if sys.platform != "darwin":
+            return
+        try:
+            appkit = importlib.import_module("AppKit")
+            appkit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        except Exception as error:
+            print(f"[WARN] Could not activate Clippy on macOS: {error}")
+
     def toggle_window(self):
         """Toggle window visibility strictly on shortcut call."""
-        if self.isVisible():
+        if self.isVisible() and not self.isMinimized():
             self.hide()
         else:
             self.search_bar.clear()
             self._render_list()
+            self.showNormal()
             self.show()
             self.raise_()
+            self._activate_native_application()
             self.activateWindow()
             self.search_bar.setFocus()
 

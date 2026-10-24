@@ -51,8 +51,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create 1.2.0 dist/Clippy.dmg \
+          set -euo pipefail
+          subject="$(git log -1 --format=%s)"
+          if [[ "$subject" =~ ^release:\ publish\ Clippy\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+          else
+            echo "Commit subject must be 'release: publish Clippy vX.Y.Z'." >&2
+            exit 1
+          fi
+
+          notes_file="release-notes/${version}.md"
+          if [[ ! -f "$notes_file" ]]; then
+            echo "Release notes not found: $notes_file" >&2
+            exit 1
+          fi
+
+          gh release create "$version" dist/Clippy.dmg \
             --repo mr-stepler/Clippy \
             --target "$GITHUB_SHA" \
-            --title "Clippy v1.2.0" \
-            --notes-file release-notes/1.2.0.md
+            --title "Clippy v$version" \
+            --notes-file "$notes_file"
