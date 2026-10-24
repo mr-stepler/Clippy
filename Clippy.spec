@@ -30,7 +30,7 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    codesign_identity=None,
+    codesign_identity='-',  # Ad-hoc signature keeps macOS bundle identity stable.
     entitlements_file=None,
     icon=['icon.icns'],
 )
@@ -47,5 +47,11 @@ app = BUNDLE(
     coll,
     name='Clippy.app',
     icon='icon.icns',
-    bundle_identifier=None,
+    bundle_identifier='com.mrstepler.clippy',
+    codesign_identity='-',
+    info_plist={
+        'LSUIElement': True,
+        'NSHighResolutionCapable': True,
+        'LSMinimumSystemVersion': '13.0',
+    },
 )
