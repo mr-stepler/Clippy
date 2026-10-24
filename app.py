@@ -21,13 +21,6 @@ try:
 except ImportError:
     pass
 
-# Quartz (part of pyobjc) is macOS-only and optional: without it, auto-paste
-# is simply disabled rather than crashing the app.
-try:
-    import Quartz
-except ImportError:
-    Quartz = None
-
 from pynput import keyboard
 from PySide6.QtCore import (
     QBuffer,
@@ -106,19 +99,6 @@ def classify_text(text: str) -> str:
     return "text"
 
 
-def simulate_cmd_v():
-    """Synthesize a system-wide Cmd+V keystroke (macOS only, needs Accessibility access)."""
-    if Quartz is None:
-        return
-    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
-    key_down = Quartz.CGEventCreateKeyboardEvent(src, 9, True)   # 9 == 'V'
-    Quartz.CGEventSetFlags(key_down, Quartz.kCGEventFlagMaskCommand)
-    key_up = Quartz.CGEventCreateKeyboardEvent(src, 9, False)
-    Quartz.CGEventSetFlags(key_up, Quartz.kCGEventFlagMaskCommand)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_down)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_up)
-
-
 # Enforce single instance execution using a lock file
 lock_file = "/tmp/Clippy.lock"
 try:
@@ -145,25 +125,86 @@ class HotkeySignal(QObject):
 
 
 class HotkeyListenerThread(QThread):
-    """Background thread listening for the configured global shortcut."""
+    """Listen for the configured shortcut, activating only on its final key."""
+
+    MODIFIER_NAMES = {
+        "cmd", "cmd_l", "cmd_r", "ctrl", "ctrl_l", "ctrl_r",
+        "alt", "alt_l", "alt_r", "alt_gr", "shift", "shift_l", "shift_r",
+    }
+    MODIFIER_ALIASES = {
+        "cmd_l": "cmd", "cmd_r": "cmd",
+        "ctrl_l": "ctrl", "ctrl_r": "ctrl",
+        "alt_l": "alt", "alt_r": "alt",
+        "shift_l": "shift", "shift_r": "shift",
+    }
 
     def __init__(self, hk_signal, hotkey):
         super().__init__()
         self.signal = hk_signal
         self.hotkey = hotkey
         self.listener = None
+        self.required_keys = set()
+        self.trigger_keys = set()
+        self.pressed_keys = set()
+
+    @staticmethod
+    def _key_name(key):
+        """Return a stable lowercase name for a pynput key event."""
+        name = getattr(key, "name", None)
+        if name is not None:
+            return str(name).lower()
+
+        char = getattr(key, "char", None)
+        return str(char).lower() if char is not None else str(key).lower()
+
+    @classmethod
+    def _canonical_name(cls, name):
+        return cls.MODIFIER_ALIASES.get(name, name)
+
+    def on_press(self, key, injected=False):
+        if injected:
+            return
+
+        key_name = self._key_name(key)
+        canonical_name = self._canonical_name(key_name)
+        is_first_press = key_name not in self.pressed_keys
+        self.pressed_keys.add(key_name)
+        pressed_names = {self._canonical_name(name) for name in self.pressed_keys}
+
+        # A modifier-only chord (Cmd+Shift) must never toggle the window. The
+        # configured character key has to be pressed while every chord key is down.
+        if (
+            is_first_press
+            and canonical_name in self.trigger_keys
+            and self.required_keys.issubset(pressed_names)
+        ):
+            self.signal.triggered.emit()
+
+    def on_release(self, key, injected=False):
+        if not injected:
+            self.pressed_keys.discard(self._key_name(key))
 
     def run(self):
         try:
-            hotkeys = {self.hotkey: self.on_triggered}
-            with keyboard.GlobalHotKeys(hotkeys) as listener:
-                self.listener = listener
-                listener.join()
+            parsed_keys = keyboard.HotKey.parse(self.hotkey)
+            self.required_keys = {
+                self._canonical_name(self._key_name(key)) for key in parsed_keys
+            }
+            self.trigger_keys = self.required_keys - self.MODIFIER_NAMES
+            if not self.trigger_keys:
+                raise ValueError("The hotkey must include a non-modifier key")
+
+            self.pressed_keys.clear()
+            self.listener = keyboard.Listener(
+                on_press=self.on_press,
+                on_release=self.on_release,
+            )
+            self.listener.start()
+            self.listener.join()
         except (KeyError, ValueError, RuntimeError) as e:
             print(f"[ERROR] pynput listener: {e}")
-
-    def on_triggered(self):
-        self.signal.triggered.emit()
+        finally:
+            self.pressed_keys.clear()
 
     def stop(self):
         if self.listener:
@@ -263,8 +304,8 @@ class DeleteButton(QPushButton):
 class HistoryRowWidget(QWidget):
     """Row rendered inside the list: type-aware preview + pin/delete toggles.
 
-    Clicking anywhere on the row except the two buttons pastes the item;
-    the pin/delete buttons only fire their own signals.
+    Clicking anywhere on the row except the two buttons copies the item to
+    the system clipboard; it never pastes into another app.
     """
 
     MONOSPACE = "'SF Mono', Menlo, Consolas, monospace"
@@ -312,9 +353,16 @@ class HistoryRowWidget(QWidget):
         once async data (e.g. a fetched favicon/title) becomes available."""
         if item["type"] == "image":
             image: QImage = item["data"]
-            pixmap = QPixmap.fromImage(image).scaled(
-                28, 28, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
-            )
+            pixmap = item.get("_thumbnail")
+            if pixmap is None:
+                pixmap = QPixmap.fromImage(image).scaled(
+                    28, 28,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                # Reuse the tiny preview when search/filter changes rebuild rows.
+                item["_thumbnail"] = pixmap
+
             self.icon_label.show()
             self.icon_label.setText("")
             self.icon_label.setPixmap(pixmap)
@@ -345,12 +393,19 @@ class HistoryRowWidget(QWidget):
             self.icon_label.show()
             favicon_b64 = item.get("link_favicon_b64")
             if favicon_b64:
-                pixmap = QPixmap()
-                pixmap.loadFromData(base64.b64decode(favicon_b64))
+                pixmap = item.get("_favicon_pixmap")
+                if pixmap is None:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(base64.b64decode(favicon_b64))
+                    pixmap = pixmap.scaled(
+                        20, 20,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    item["_favicon_pixmap"] = pixmap
+
                 self.icon_label.setText("")
-                self.icon_label.setPixmap(
-                    pixmap.scaled(20, 20, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                )
+                self.icon_label.setPixmap(pixmap)
                 self.icon_label.setStyleSheet("background: transparent;")
             else:
                 self.icon_label.setPixmap(QPixmap())
@@ -376,7 +431,7 @@ class HistoryRowWidget(QWidget):
 
     def mousePressEvent(self, event):
         # Clicks that land on a button are consumed by the button itself and
-        # never reach here, so any press we do see is a "paste" click.
+        # never reach here, so any press we do see copies the row to clipboard.
         if event.button() == Qt.MouseButton.LeftButton:
             self.activated.emit()
         super().mousePressEvent(event)
@@ -427,9 +482,9 @@ class HotkeyCaptureField(QLineEdit):
 
 
 class SettingsDialog(QDialog):
-    """Minimal settings panel: global hotkey, auto-paste, link previews."""
+    """Minimal settings panel for the global hotkey and link previews."""
 
-    def __init__(self, current_hotkey, auto_paste, fetch_previews, parent=None):
+    def __init__(self, current_hotkey, fetch_previews, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Clippy Settings")
         self.setFixedWidth(300)
@@ -455,10 +510,6 @@ class SettingsDialog(QDialog):
         self.hotkey_field = HotkeyCaptureField(current_hotkey, self)
         form.addRow("Global hotkey:", self.hotkey_field)
 
-        self.auto_paste_checkbox = QCheckBox("Auto-paste (Cmd+V) after selecting", self)
-        self.auto_paste_checkbox.setChecked(auto_paste)
-        form.addRow(self.auto_paste_checkbox)
-
         self.fetch_previews_checkbox = QCheckBox("Fetch link title && favicon (uses network)", self)
         self.fetch_previews_checkbox.setChecked(fetch_previews)
         form.addRow(self.fetch_previews_checkbox)
@@ -473,11 +524,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
     def result_values(self):
-        return (
-            self.hotkey_field.hotkey,
-            self.auto_paste_checkbox.isChecked(),
-            self.fetch_previews_checkbox.isChecked(),
-        )
+        return self.hotkey_field.hotkey, self.fetch_previews_checkbox.isChecked()
 
 
 class ClipboardApp(QWidget):
@@ -497,7 +544,6 @@ class ClipboardApp(QWidget):
         self.active_filter = "all"  # "all" | "text" | "image"
 
         self.hotkey = SETTINGS.value("hotkey", DEFAULT_HOTKEY, type=str)
-        self.auto_paste_enabled = SETTINGS.value("auto_paste", True, type=bool)
         self.fetch_previews_enabled = SETTINGS.value("fetch_link_previews", False, type=bool)
 
         # UI widget declarations
@@ -717,7 +763,7 @@ class ClipboardApp(QWidget):
 
         self._render_list()
 
-    def show_toast(self, message="copied!"):
+    def show_toast(self, message="copied to clipboard"):
         """Show a small dark popup right next to the mouse cursor."""
         self.toast_label.setText(message)
         self.toast_label.adjustSize()
@@ -749,13 +795,11 @@ class ClipboardApp(QWidget):
     # --- Settings / hotkey ------------------------------------------------
 
     def open_settings(self):
-        dialog = SettingsDialog(self.hotkey, self.auto_paste_enabled, self.fetch_previews_enabled, self)
+        dialog = SettingsDialog(self.hotkey, self.fetch_previews_enabled, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            new_hotkey, auto_paste, fetch_previews = dialog.result_values()
+            new_hotkey, fetch_previews = dialog.result_values()
             if new_hotkey != self.hotkey:
                 self.apply_hotkey(new_hotkey)
-            self.auto_paste_enabled = auto_paste
-            SETTINGS.setValue("auto_paste", auto_paste)
             self.fetch_previews_enabled = fetch_previews
             SETTINGS.setValue("fetch_link_previews", fetch_previews)
 
@@ -772,9 +816,11 @@ class ClipboardApp(QWidget):
 
     @staticmethod
     def _make_image_key(image: QImage):
-        """Cheap fingerprint used to recognize a previously-seen image."""
-        img_bytes = image.bits().tobytes()
-        return (image.width(), image.height(), len(img_bytes), hash(img_bytes[:1000]))
+        """Fingerprint an image without copying its full pixel buffer."""
+        image_size = image.sizeInBytes()
+        sample_size = min(1000, image_size)
+        sample = bytes(image.constBits()[:sample_size])
+        return (image.width(), image.height(), image_size, hash(sample))
 
     @staticmethod
     def _content_key(item):
@@ -1046,7 +1092,7 @@ class ClipboardApp(QWidget):
     def _add_item_to_widget(self, item):
         """Helper to create and insert a row (preview + pin/delete) into the list."""
         row = HistoryRowWidget(item)
-        row.activated.connect(lambda it=item: self.paste_selected(it))
+        row.activated.connect(lambda it=item: self.copy_selected_to_clipboard(it))
         row.pin_toggled.connect(lambda it=item: self.toggle_pin(it))
         row.delete_requested.connect(lambda it=item: self.delete_item(it))
 
@@ -1112,9 +1158,8 @@ class ClipboardApp(QWidget):
         self.clipboard.clear()
         self._render_list()
 
-    def paste_selected(self, item):
-        """Copy the given history item back to the system clipboard, then
-        optionally auto-paste it into whatever app had focus before Clippy."""
+    def copy_selected_to_clipboard(self, item):
+        """Copy a history item back to the system clipboard without pasting it."""
         if not item:
             return
 
@@ -1143,11 +1188,7 @@ class ClipboardApp(QWidget):
                 self.clipboard.setImage(image)
             self.last_clip_text = ""
 
-        self.show_toast("copied!")
-
-        if self.auto_paste_enabled and Quartz is not None and sys.platform == "darwin":
-            self.hide()  # return focus to whatever app was active before Clippy
-            QTimer.singleShot(80, simulate_cmd_v)
+        self.show_toast("copied to clipboard")
 
     def toggle_window(self):
         """Toggle window visibility strictly on shortcut call."""
