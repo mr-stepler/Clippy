@@ -19,8 +19,8 @@ A lightweight, minimal, and fast clipboard manager for macOS built with Python a
 
 ## 💻 System Requirements & Compatibility
 
-* **Pre-built Binary (`.dmg`):** macOS 11.0+ (Apple Silicon: M1 or newer)
-* **From Source:** macOS (Apple Silicon & Intel), Windows, Linux
+* **Pre-built Binary (`.dmg`):** macOS 13+ (Apple Silicon: M1 or newer)
+* **From Source:** macOS 13+ (Apple Silicon & Intel), Windows, Linux
 
 ---
 
@@ -56,11 +56,16 @@ If you want to run the project locally or build it on other platforms:
 
 ## 📦 Build Specifications
 
-The pre-built `.dmg` release is packaged using **PyInstaller**. You can inspect the build configuration in the [`Clippy.spec`](./Clippy.spec) file included in the repository.
+The macOS `.app` and `.dmg` installer are built with **PyInstaller**. The workflow and script create the required `.icns` from the checked-in `icon.JPG`, package the app, and add an Applications shortcut to the disk image.
 
-To build the executable yourself:
-pip install pyinstaller
-pyinstaller Clippy.spec
+On an Apple Silicon Mac, install the build dependencies and run:
+
+```bash
+python3 -m pip install PyInstaller "PySide6==6.11.2" "pynput==1.8.1"
+bash scripts/build_macos_dmg.sh
+```
+
+The outputs are `dist/Clippy.app` and `dist/Clippy.dmg`. The underlying PyInstaller configuration is in [`Clippy.spec`](./Clippy.spec).
 
 ---
 
