@@ -210,6 +210,11 @@ class HotkeyListenerThread(QThread):
         self._active_key = None
         self._state_lock = threading.RLock()
         self._stop_requested = threading.Event()
+        # The hotkey press callback runs before pynput's Darwin intercept in the
+        # same event-tap callback. Use that shared decision to suppress exactly
+        # the final key event that completed the chord.
+        self._active_darwin_keycode = None
+        self._pending_darwin_keydowns = set()
         self._suppressed_darwin_keycodes = set()
         self._quartz = None
         self._reported_untrusted = False
@@ -267,6 +272,8 @@ class HotkeyListenerThread(QThread):
             self.trigger_keys = trigger_keys
             self.required_modifiers = required_modifiers
             self._active_key = None
+            self._active_darwin_keycode = None
+            self._pending_darwin_keydowns.clear()
             self._suppressed_darwin_keycodes.clear()
 
     def on_press(self, key, injected=False):
@@ -280,14 +287,22 @@ class HotkeyListenerThread(QThread):
             if listener is None:
                 return
             canonical_key = listener.canonical(key)
+            active_keycode = getattr(canonical_key, "vk", None)
+            try:
+                active_keycode = int(active_keycode) if active_keycode is not None else None
+            except (TypeError, ValueError):
+                active_keycode = None
+
             with self._state_lock:
                 self._active_key = self._key_name(canonical_key)
+                self._active_darwin_keycode = active_keycode
                 try:
                     # HotKey waits for the complete chord; modifiers alone never
                     # activate Clippy. The main key must still be pressed last.
                     self.hotkey_state.press(canonical_key)
                 finally:
                     self._active_key = None
+                    self._active_darwin_keycode = None
         except Exception as error:
             # A platform-specific keyboard event must never take down the listener.
             print(f"[WARN] Ignoring unsupported key press {key!r}: {error}")
@@ -311,68 +326,58 @@ class HotkeyListenerThread(QThread):
     def _on_hotkey_activated(self):
         # Ignore activation if the chord became complete by pressing a modifier
         # after the main key; require the configured non-modifier key last.
-        if self._active_key in self.trigger_keys:
+        # pynput invokes this while handling the key-down event, before its
+        # Darwin intercept runs. Record that exact event for selective suppression.
+        should_emit = False
+        with self._state_lock:
+            if self._active_key in self.trigger_keys:
+                keycode = self._active_darwin_keycode
+                if sys.platform == "darwin" and keycode is not None:
+                    self._pending_darwin_keydowns.add(keycode)
+                should_emit = True
+
+        if should_emit:
             self.signal.triggered.emit()
 
     def _intercept_darwin_event(self, event_type, event):
-        """Consume only the configured chord so the front app cannot beep on it."""
+        """Consume only the trigger key that completed the configured chord."""
         quartz = self._quartz
         if quartz is None:
             return event
 
+        if event_type not in (quartz.kCGEventKeyDown, quartz.kCGEventKeyUp):
+            return event
+
         try:
-            if event_type == quartz.kCGEventKeyUp:
-                source_pid = quartz.CGEventGetIntegerValueField(
-                    event, quartz.kCGEventSourceUnixProcessID
-                )
-                if source_pid:
-                    return event
-                keycode = int(quartz.CGEventGetIntegerValueField(
-                    event, quartz.kCGKeyboardEventKeycode))
-                with self._state_lock:
-                    if keycode in self._suppressed_darwin_keycodes:
-                        self._suppressed_darwin_keycodes.discard(keycode)
-                        return None
-                return event
-
-            if event_type != quartz.kCGEventKeyDown:
-                return event
-
-            # Match pynput's own injected-event detection so synthetic keystrokes
-            # from automation are never swallowed while this tap is active.
-            source_pid = quartz.CGEventGetIntegerValueField(
-                event, quartz.kCGEventSourceUnixProcessID
-            )
-            if source_pid:
-                return event
-
-            listener = self.listener
-            if listener is None:
-                return event
-            key = listener.canonical(listener._event_to_key(event))
-            key_name = self._key_name(key)
             keycode = int(quartz.CGEventGetIntegerValueField(
                 event, quartz.kCGKeyboardEventKeycode))
-            flags = int(quartz.CGEventGetFlags(event))
-
-            flag_by_modifier = {
-                "cmd": quartz.kCGEventFlagMaskCommand,
-                "ctrl": quartz.kCGEventFlagMaskControl,
-                "alt": quartz.kCGEventFlagMaskAlternate,
-                "shift": quartz.kCGEventFlagMaskShift,
-            }
             with self._state_lock:
-                if key_name not in self.trigger_keys:
-                    return event
+                if event_type == quartz.kCGEventKeyDown:
+                    # Keep consuming key-repeat events until the physical key-up.
+                    if keycode in self._suppressed_darwin_keycodes:
+                        return None
 
-                required_flags = 0
-                for modifier in self.required_modifiers:
-                    required_flags |= flag_by_modifier.get(modifier, 0)
-                if flags & required_flags != required_flags:
-                    return event
+                    # pynput dispatches on_press before invoking this intercept.
+                    # That callback has already verified the full chord and
+                    # queued this exact physical keycode; no second, potentially
+                    # divergent key/flag interpretation is needed here.
+                    if keycode not in self._pending_darwin_keydowns:
+                        return event
 
-                self._suppressed_darwin_keycodes.add(keycode)
-            return None
+                    self._pending_darwin_keydowns.discard(keycode)
+                    self._suppressed_darwin_keycodes.add(keycode)
+                    return None
+
+                # Consume the matching key-up as well so the active app never
+                # receives an incomplete key pair. Clear both sets defensively
+                # if macOS delivered the release without a corresponding down.
+                should_suppress = (
+                    keycode in self._suppressed_darwin_keycodes
+                    or keycode in self._pending_darwin_keydowns
+                )
+                self._suppressed_darwin_keycodes.discard(keycode)
+                self._pending_darwin_keydowns.discard(keycode)
+                return None if should_suppress else event
         except Exception as error:
             # Fail open: never swallow a user's keystroke if Quartz cannot inspect it.
             print(f"[WARN] Could not inspect macOS hotkey event: {error}")
@@ -452,6 +457,8 @@ class HotkeyListenerThread(QThread):
                         self._parsed_keys, self._on_hotkey_activated
                     )
                     self._active_key = None
+                    self._active_darwin_keycode = None
+                    self._pending_darwin_keydowns.clear()
                     self._suppressed_darwin_keycodes.clear()
                     if not self._stop_requested.is_set():
                         listener.start()
@@ -484,6 +491,8 @@ class HotkeyListenerThread(QThread):
                         self._parsed_keys, self._on_hotkey_activated
                     )
                     self._active_key = None
+                    self._active_darwin_keycode = None
+                    self._pending_darwin_keydowns.clear()
                     self._suppressed_darwin_keycodes.clear()
 
             if self._stop_requested.wait(self.LISTENER_RETRY_SECONDS):
