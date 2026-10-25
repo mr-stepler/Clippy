@@ -71,10 +71,11 @@ The outputs are `dist/Clippy.app` and `dist/Clippy.dmg`. The underlying PyInstal
 
 ## 🗑 Uninstallation
 
-To completely remove Clippy and clear all its cached data, configurations, and system permissions:
+The uninstaller closes Clippy, removes its app bundle from `/Applications` or `~/Applications`, and deletes Clippy's local settings, pinned items, caches, and lock files. Removing the app from `/Applications` may trigger a macOS administrator authorization prompt.
 
 1. Open the downloaded `.dmg` image (or locate `uninstall.command` in the project folder).
-2. Double-click **`uninstall.command`**.
+2. Double-click **`uninstall.command`** and review its output for any paths it could not remove.
+3. macOS privacy permissions are managed separately: if desired, remove Clippy manually from **System Settings → Privacy & Security → Accessibility** and **Input Monitoring**.
 
 ---
 
