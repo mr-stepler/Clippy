@@ -47,5 +47,7 @@ app = BUNDLE(
     coll,
     name='Clippy.app',
     icon='icon.icns',
-    bundle_identifier=None,
+    # A stable bundle identifier lets macOS keep TCC permissions attached to
+    # the local app across launches, even while it remains ad-hoc/unsigned.
+    bundle_identifier='com.mrstepler.clippy',
 )
