@@ -287,7 +287,9 @@ class HotkeyListenerThread(QThread):
             if listener is None:
                 return
             canonical_key = listener.canonical(key)
-            active_keycode = getattr(canonical_key, "vk", None)
+            # pynput's canonical() drops the virtual key code for character keys,
+            # so keep the native value from the original macOS event key.
+            active_keycode = getattr(key, "vk", None)
             try:
                 active_keycode = int(active_keycode) if active_keycode is not None else None
             except (TypeError, ValueError):
