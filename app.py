@@ -1,14 +1,91 @@
 import base64
+import faulthandler
 import fcntl
 import html
 import importlib
 import json
+import logging
 import os
 import re
 import sys
 import threading
 from html.parser import HTMLParser
+from logging.handlers import RotatingFileHandler
 from urllib.parse import urlsplit
+
+
+def _configure_logging():
+    """Persist diagnostics for windowed macOS builds, which have no console."""
+    logger = logging.getLogger("clippy")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if sys.platform == "darwin":
+        log_dir = os.path.expanduser("~/Library/Logs/Clippy")
+    else:
+        log_dir = os.path.join(os.path.expanduser("~"), ".clippy", "logs")
+    log_path = os.path.join(log_dir, "Clippy.log")
+
+    if not logger.handlers:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            handler = RotatingFileHandler(
+                log_path,
+                maxBytes=1_000_000,
+                backupCount=3,
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.addHandler(logging.NullHandler())
+            return None
+
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(threadName)s: %(message)s"
+        ))
+        logger.addHandler(handler)
+
+    return log_path
+
+
+LOGGER = logging.getLogger("clippy")
+LOG_FILE_PATH = _configure_logging()
+_FATAL_LOG_STREAM = None
+if LOG_FILE_PATH is not None:
+    try:
+        _FATAL_LOG_STREAM = open(LOG_FILE_PATH, "a", encoding="utf-8")
+        faulthandler.enable(file=_FATAL_LOG_STREAM, all_threads=True)
+    except (OSError, RuntimeError, ValueError):
+        _FATAL_LOG_STREAM = None
+        LOGGER.exception("Could not enable fatal-error traceback logging")
+
+LOGGER.info(
+    "Process starting: platform=%s executable=%s cwd=%s log=%s",
+    sys.platform, sys.executable, os.getcwd(), LOG_FILE_PATH,
+)
+
+
+def _log_uncaught_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        if sys.__excepthook__ is not None:
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    LOGGER.critical(
+        "Uncaught exception on the main thread",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+
+
+def _log_uncaught_thread_exception(args):
+    LOGGER.critical(
+        "Uncaught exception in thread %s",
+        args.thread.name,
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+sys.excepthook = _log_uncaught_exception
+if hasattr(threading, "excepthook"):
+    threading.excepthook = _log_uncaught_thread_exception
 
 # Import PySide6 first and neutralize its "__feature__" auto-detection hook
 # *before* anything else is imported. That hook wraps every subsequent
@@ -164,7 +241,9 @@ try:
     lock_file_fd = open(lock_file, "w")
     fcntl.lockf(lock_file_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except (IOError, OSError):
+    LOGGER.info("Another Clippy process holds the single-instance lock; exiting.")
     sys.exit(0)
+LOGGER.info("Single-instance lock acquired: %s", lock_file)
 
 # Hide application icon from the macOS Dock (Agent Application mode)
 if sys.platform == "darwin":
@@ -305,9 +384,9 @@ class HotkeyListenerThread(QThread):
                 finally:
                     self._active_key = None
                     self._active_darwin_keycode = None
-        except Exception as error:
+        except Exception:
             # A platform-specific keyboard event must never take down the listener.
-            print(f"[WARN] Ignoring unsupported key press {key!r}: {error}")
+            LOGGER.exception("Ignoring unsupported keyboard press (%s)", type(key).__name__)
 
     def on_release(self, key, injected=False):
         if injected or key is None:
@@ -322,8 +401,8 @@ class HotkeyListenerThread(QThread):
             canonical_key = listener.canonical(key)
             with self._state_lock:
                 self.hotkey_state.release(canonical_key)
-        except Exception as error:
-            print(f"[WARN] Ignoring unsupported key release {key!r}: {error}")
+        except Exception:
+            LOGGER.exception("Ignoring unsupported keyboard release (%s)", type(key).__name__)
 
     def _on_hotkey_activated(self):
         # Ignore activation if the chord became complete by pressing a modifier
@@ -339,6 +418,7 @@ class HotkeyListenerThread(QThread):
                 should_emit = True
 
         if should_emit:
+            LOGGER.info("Configured global hotkey was activated.")
             self.signal.triggered.emit()
 
     def _intercept_darwin_event(self, event_type, event):
@@ -380,9 +460,9 @@ class HotkeyListenerThread(QThread):
                 self._suppressed_darwin_keycodes.discard(keycode)
                 self._pending_darwin_keydowns.discard(keycode)
                 return None if should_suppress else event
-        except Exception as error:
+        except Exception:
             # Fail open: never swallow a user's keystroke if Quartz cannot inspect it.
-            print(f"[WARN] Could not inspect macOS hotkey event: {error}")
+            LOGGER.exception("Could not inspect macOS hotkey event")
             return event
 
     def _keyboard_listener_class(self):
@@ -416,12 +496,16 @@ class HotkeyListenerThread(QThread):
 
         def recover_disabled_tap(listener, proxy, event_type, event, refcon):
             if event_type in disabled_events:
+                LOGGER.warning(
+                    "macOS disabled the keyboard event tap (event_type=%r); re-enabling",
+                    event_type,
+                )
                 try:
                     event_tap = getattr(listener, "_clippy_event_tap", None)
                     if event_tap is not None:
                         quartz.CGEventTapEnable(event_tap, True)
-                except Exception as error:
-                    print(f"[WARN] Could not re-enable macOS keyboard event tap: {error}")
+                except Exception:
+                    LOGGER.exception("Could not re-enable macOS keyboard event tap")
                 return event
             return keyboard.Listener._handler(
                 listener, proxy, event_type, event, refcon
@@ -441,10 +525,15 @@ class HotkeyListenerThread(QThread):
         )
 
     def run(self):
+        LOGGER.info(
+            "Hotkey listener worker starting: platform=%s hotkey=%s",
+            sys.platform, self.hotkey,
+        )
         while not self._stop_requested.is_set():
             listener = None
             try:
                 listener_class = self._keyboard_listener_class()
+                LOGGER.info("Creating pynput listener: %s", listener_class.__name__)
                 listener_options = {
                     "on_press": self.on_press,
                     "on_release": self.on_release,
@@ -464,6 +553,10 @@ class HotkeyListenerThread(QThread):
                     self._suppressed_darwin_keycodes.clear()
                     if not self._stop_requested.is_set():
                         listener.start()
+                        LOGGER.info(
+                            "pynput listener started: trusted=%r alive=%r",
+                            getattr(listener, "IS_TRUSTED", None), listener.is_alive(),
+                        )
 
                 if self._stop_requested.is_set():
                     break
@@ -471,20 +564,25 @@ class HotkeyListenerThread(QThread):
                 if self._stop_requested.is_set():
                     break
 
-                if getattr(listener, "IS_TRUSTED", None) is False:
+                is_trusted = getattr(listener, "IS_TRUSTED", None)
+                listener_exception = getattr(listener, "exception", None)
+                LOGGER.warning(
+                    "pynput listener stopped: trusted=%r exception=%r",
+                    is_trusted, listener_exception,
+                )
+                if is_trusted is False:
                     if not self._reported_untrusted:
-                        print(
-                            "[ERROR] macOS is blocking Clippy's keyboard listener. "
-                            "Enable Clippy in System Settings → Privacy & Security "
-                            "→ Accessibility and Input Monitoring."
+                        LOGGER.error(
+                            "macOS blocked Clippy's keyboard listener; "
+                            "the event tap is not trusted."
                         )
                     self._reported_untrusted = True
                 else:
                     self._reported_untrusted = False
-                    print("[WARN] Keyboard listener stopped unexpectedly; restarting.")
-            except Exception as error:
+                    LOGGER.warning("Keyboard listener stopped unexpectedly; restarting.")
+            except Exception:
                 if not self._stop_requested.is_set():
-                    print(f"[ERROR] pynput listener stopped unexpectedly: {error}")
+                    LOGGER.exception("pynput listener stopped unexpectedly")
             finally:
                 with self._state_lock:
                     if self.listener is listener:
@@ -899,7 +997,10 @@ class ClipboardApp(QWidget):
         try:
             HotkeyListenerThread.parse_hotkey(self.hotkey)
         except (KeyError, ValueError) as error:
-            print(f"[WARN] Invalid saved hotkey {self.hotkey!r}; restoring the default: {error}")
+            LOGGER.warning(
+                "Invalid saved hotkey %r; restoring the default: %s",
+                self.hotkey, error,
+            )
             self.hotkey = DEFAULT_HOTKEY
             SETTINGS.setValue("hotkey", self.hotkey)
 
@@ -946,6 +1047,7 @@ class ClipboardApp(QWidget):
         self.hotkey_signal = HotkeySignal()
         self.hotkey_signal.triggered.connect(self.toggle_window)
         self.listener_thread = HotkeyListenerThread(self.hotkey_signal, self.hotkey)
+        LOGGER.info("Starting global hotkey listener for %s", self.hotkey)
         self.listener_thread.start()
 
     def init_ui(self):
@@ -1276,8 +1378,8 @@ class ClipboardApp(QWidget):
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
             os.replace(tmp_path, PINNED_STORE_PATH)
-        except OSError as e:
-            print(f"[WARN] failed to save pinned items: {e}")
+        except OSError:
+            LOGGER.exception("Failed to save pinned items")
 
     def _load_pinned(self):
         """Load items pinned in a previous session, most-recently-pinned first."""
@@ -1287,8 +1389,8 @@ class ClipboardApp(QWidget):
         try:
             with open(PINNED_STORE_PATH, "r", encoding="utf-8") as f:
                 payload = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"[WARN] failed to load pinned items: {e}")
+        except (OSError, json.JSONDecodeError):
+            LOGGER.exception("Failed to load pinned items")
             return
 
         restored = [item for item in (self._deserialize_item(raw) for raw in payload) if item]
@@ -1639,12 +1741,14 @@ class ClipboardApp(QWidget):
         try:
             appkit = importlib.import_module("AppKit")
             appkit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-        except Exception as error:
-            print(f"[WARN] Could not activate Clippy on macOS: {error}")
+        except Exception:
+            LOGGER.exception("Could not activate Clippy on macOS")
 
     def toggle_window(self):
         """Toggle window visibility strictly on shortcut call."""
-        if self.isVisible() and not self.isMinimized():
+        currently_visible = self.isVisible() and not self.isMinimized()
+        LOGGER.info("Toggling clipboard window (currently_visible=%s)", currently_visible)
+        if currently_visible:
             self.hide()
         else:
             self.search_bar.clear()
@@ -1675,6 +1779,7 @@ class ClipboardApp(QWidget):
 
 
 if __name__ == "__main__":
+    LOGGER.info("Entering Clippy application main")
     if sys.platform == "darwin":
         # Keep physical Command and Control keys distinct in Qt key events.
         mac_modifier_attr = getattr(
@@ -1698,5 +1803,8 @@ if __name__ == "__main__":
 
     window = ClipboardApp()
     app.aboutToQuit.connect(window.shutdown)
+    LOGGER.info("Clippy initialized; entering Qt event loop")
 
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    LOGGER.info("Qt event loop exited with code %s", exit_code)
+    sys.exit(exit_code)

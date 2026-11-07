@@ -67,6 +67,10 @@ bash scripts/build_macos_dmg.sh
 
 The outputs are `dist/Clippy.app` and `dist/Clippy.dmg`. The underlying PyInstaller configuration is in [`Clippy.spec`](./Clippy.spec).
 
+### Diagnostics
+
+On macOS, startup and hotkey-listener diagnostics are written to `~/Library/Logs/Clippy/Clippy.log`. The log does not record clipboard contents or ordinary keystrokes.
+
 ---
 
 ## 🗑 Uninstallation
